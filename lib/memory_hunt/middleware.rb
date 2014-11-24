@@ -52,7 +52,7 @@ module MemoryHunt
       report_filename = format('tmp/report_%s.txt', request.uuid)
 
       File.open(Rails.root.join(report_filename), 'w') do |f|
-        f.puts "Report for #{request.path}\n"
+        f.puts "Report for #{request.path}\n\n"
 
         references = {}
         obj_infos.each do |addr,i|
