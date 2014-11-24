@@ -69,7 +69,7 @@ module MemoryHunt
         f.puts "Rails app"
         f.puts "---------\n"
         rails_addrs = leaked_addrs.select {|i| obj_infos[i]['file'] && obj_infos[i]['file'].starts_with?(Rails.root.to_s) }
-        output_leaks(f, rails_addrs, obj_infos)
+        output_leaks(f, rails_addrs, obj_infos, 5)
 
         f.puts "Gems"
         f.puts "----\n"
@@ -82,7 +82,7 @@ module MemoryHunt
     end
 
     # Inspired by http://blog.skylight.io/hunting-for-leaks-in-ruby/
-    def output_leaks(f, addresses, obj_infos, depth = 0, parents = [])
+    def output_leaks(f, addresses, obj_infos, max_depth = 0, depth = 0, parents = [])
       relevant_objs = obj_infos.slice(*addresses).values
 
       relevant_objs.group_by do |x|
@@ -93,9 +93,9 @@ module MemoryHunt
         b[1] <=> a[1]
       end.each do |group,count,bytesize,memsize,referenced_by|
         f.puts " " * depth + "Leaked #{count} #{group['type']} objects of size #{bytesize}/#{memsize} at: #{group['file']}:#{group['line']}"
-        unless depth > 2
+        unless depth >= max_depth
           parents = parents + addresses
-          output_leaks(f, referenced_by - parents, obj_infos, depth + 1, parents + referenced_by)
+          output_leaks(f, referenced_by - parents, obj_infos, max_depth, depth + 1, parents + referenced_by)
         end
       end
 
