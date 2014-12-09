@@ -26,54 +26,31 @@ module MemoryHunt
     private
 
     def find_leak(request, additional_calls: 1, &block)
-      result, leaked_addrs = nil
-
-      # Inventory of objects already existing
+      # Run block once to get return value and avoid false positives
+      result = block.call
       GC.start
-      initial_addrs = ObjspaceHelpers.dump_all_addresses
+      GC.start
 
-      # Run once with full object tracing
-      ObjectSpace::trace_object_allocations do
-        result = block.call
-        GC.start
-        leaked_addrs = ObjspaceHelpers.dump_all_addresses - initial_addrs
-      end
+      # Run block again and try to find leaked objects
+      top_level_leaks, leaks_by_source = ObjspaceHelpers.find_leak_sources(trace: true, &block)
 
-      # Now eliminate all objects GCed in subsequent requests
-      additional_calls.times.each do
-        block.call
-        GC.start
-        leaked_addrs = leaked_addrs & ObjspaceHelpers.dump_all_addresses
-      end
-
-      # Find the actual address info
-      obj_infos = ObjspaceHelpers.info_for_address(leaked_addrs)
-
-      report_filename = format('tmp/report_%s.txt', request.uuid)
+      report_filename = format('tmp/report_%s.txt', Time.now.to_i)
 
       File.open(Rails.root.join(report_filename), 'w') do |f|
-        f.puts "Report for #{request.path}\n\n"
+        f.puts "Report for #{request.path}\n"
 
-        references = {}
-        obj_infos.each do |addr,i|
-          (i['references'] || []).each do |ref|
-            references[ref] ||= []
-            references[ref] << addr
-          end
-        end
-
-        obj_infos.each do |addr,i|
-          i['referenced_by'] = (references[addr] || []) - [addr]
-        end
-
-        f.puts "Rails app"
+        f.puts "\nRails app"
         f.puts "---------\n"
-        rails_addrs = leaked_addrs.select {|i| obj_infos[i]['file'] && obj_infos[i]['file'].starts_with?(Rails.root.to_s) }
-        output_leaks(f, rails_addrs, obj_infos, 5)
+        rails_leaks = leaks_by_source.keys.select {|source| source.info['file'] && source.info['file'].starts_with?(Rails.root.to_s) }
+        output_leaks(f, leaks_by_source.slice(rails_leaks))
 
-        f.puts "Gems"
+        f.puts "\nGems"
         f.puts "----\n"
-        output_leaks(f, leaked_addrs - rails_addrs, obj_infos)
+        output_leaks(f, leaks_by_source.except(rails_leaks))
+
+        f.puts "\nTop-level leaks"
+        f.puts "---------------\n"
+        f.puts format("Not implemented, failed to display %d leaks", top_level_leaks.size)
       end
 
       Rails.logger.info "Memory leak statistics saved to #{report_filename}"
@@ -82,27 +59,32 @@ module MemoryHunt
     end
 
     # Inspired by http://blog.skylight.io/hunting-for-leaks-in-ruby/
-    def output_leaks(f, addresses, obj_infos, max_depth = 0, depth = 0, parents = [])
-      relevant_objs = obj_infos.slice(*addresses).values
-
-      relevant_objs.group_by do |x|
-        x.slice('type', 'file', 'line')
-      end.map do |group,y|
-        [group, y.count, y.sum {|i| i['bytesize'] || 0 }, y.sum {|i| i['memsize'] || 0 }, y.map {|i| i['referenced_by'] }.flatten]
+    def output_leaks(f, leaks_by_source)
+      leaks_by_source.group_by do |source, leaks|
+        info = source.info
+        Gem.paths.path.each { |p| info['file'].gsub! %r{^#{p}/}, '' } if info['file']
+        info.slice('type', 'file', 'line')
+      end.map do |group, y|
+        [group, y.count, y.map {|_source, leaks| leaks }.flatten]
       end.sort do |a,b|
         b[1] <=> a[1]
-      end.each do |group,count,bytesize,memsize,referenced_by|
-        f.puts " " * depth + "Leaked #{count} #{group['type']} objects of size #{bytesize}/#{memsize} at: #{group['file']}:#{group['line']}"
-        unless depth >= max_depth
-          parents = parents + addresses
-          output_leaks(f, referenced_by - parents, obj_infos, max_depth, depth + 1, parents + referenced_by)
-        end
-      end
+      end.each do |group, count, leaks|
+        f.puts "#{count} left-over #{group['type']}s referenced by #{group['file']}:#{group['line']}"
 
-      if depth == 0
-        memsize = relevant_objs.sum {|i| i['memsize'] || 0 }
-        bytesize = relevant_objs.sum {|i| i['bytesize'] || 0 }
-        f.puts "\nTotal Size: #{bytesize}/#{memsize}\n\n"
+        leaks.group_by do |leak|
+          info = leak.info
+          Gem.paths.path.each { |p| info['file'].gsub! %r{^#{p}/}, '' } if info['file']
+          info.slice('type', 'file', 'line')
+        end.map do |group, y|
+          [group, y.count, y.map {|leak| leak.info['value'] }.compact]
+        end.sort do |a,b|
+          b[1] <=> a[1]
+        end.each do |group, count, values|
+          f.puts "  #{count} #{group['type']} at #{group['file']}:#{group['line']}"
+          values.each do |v|
+            f.puts format("   value (%d): %s", v.size, v[0..100].inspect)
+          end
+        end
       end
     end
   end
